@@ -22,6 +22,10 @@ the descending neurons. Watch it with that in mind.
 
     python experiments/m5_closed_loop.py --live       # watch it play
     python experiments/m5_closed_loop.py --tics 400   # headless, for the check
+
+    # the paper's configuration, in the gentler-floor arena, for watching
+    python experiments/m5_closed_loop.py --live --paper \\
+        --scenario health_gathering_forage_easy --tics 10500
 """
 
 from __future__ import annotations
@@ -40,7 +44,14 @@ import torch  # noqa: E402
 from flydoom import config  # noqa: E402
 from flydoom.agent import AgentConfig, FlyDoomAgent  # noqa: E402
 from flydoom.doom import DoomConfig  # noqa: E402
+from flydoom.mechanosensation import MechanoConfig  # noqa: E402
 from flydoom.motor import MotorConfig  # noqa: E402
+
+# The configuration paper/data/behav_forage2/run.sh measures: smell on, spiking
+# T4, optic gain 16, DNp15 steering, touch, the 3-camera wide eye at the "fast"
+# render, the anatomical eye map, the corrected turn sign and phasic MDN.
+PAPER_EYE = dict(fov_deg=170.0, width=640, height=480, gnomonic=True,
+                 pyramid_blur=True, side_views=(90.0, -90.0))
 
 USE_COLOR = sys.stdout.isatty()
 
@@ -89,6 +100,11 @@ def main() -> int:
     ap.add_argument("--yaw-gain", type=float, default=MotorConfig.yaw_gain)
     ap.add_argument("--spiking", action="store_true",
                     help="all-spiking optic lobe (the paper's model)")
+    ap.add_argument("--paper", action="store_true",
+                    help="the paper's configuration (behav_forage2): corrected "
+                         "eye map and turn sign, phasic MDN, spiking T4, optic "
+                         "gain 16, DNp15 steering, touch, smell, wide eye")
+    ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--device", default=(os.environ.get("FLYDOOM_DEVICE")
                              or ("cuda" if torch.cuda.is_available()
                                  else "cpu")))
@@ -97,13 +113,34 @@ def main() -> int:
     print(paint("flydoom M5 — closed loop", "1"))
     print(paint("=" * 76, "90"))
 
-    cfg = AgentConfig(
-        doom=DoomConfig(scenario=args.scenario, window=not args.no_window),
-        motor=MotorConfig(yaw_gain=args.yaw_gain),
-        graded=not args.spiking,
-        bias_mv=args.bias,
-        device=args.device,
-    )
+    seed = {} if args.seed is None else {"seed": args.seed}
+    if args.paper:
+        cfg = AgentConfig(
+            doom=DoomConfig(scenario=args.scenario, window=not args.no_window,
+                            labels=True, **PAPER_EYE, **seed),
+            motor=MotorConfig(yaw_source="DNp15", fixed_turn_sign=True,
+                              phasic_mdn=True, forward_gain=0.16),
+            mechano=MechanoConfig(front_only=True),
+            eye_map="anatomical",
+            smell=True,
+            optic_gain=16.0,
+            spiking_t4=True,
+            touch=True,
+            bias_mv=args.bias,
+            device=args.device,
+            **seed,
+        )
+    else:
+        cfg = AgentConfig(
+            doom=DoomConfig(scenario=args.scenario, window=not args.no_window,
+                            **seed),
+            motor=MotorConfig(yaw_gain=args.yaw_gain),
+            graded=not args.spiking,
+            bias_mv=args.bias,
+            device=args.device,
+            **seed,
+        )
+    steer = cfg.motor.yaw_source
     t0 = time.perf_counter()
     agent = FlyDoomAgent(cfg)
     print(agent.summary())
@@ -114,7 +151,7 @@ def main() -> int:
         from flydoom.viz import LiveDashboard, have_display
         if have_display():
             pops = ["LC4", "LPLC2", "LC11", "BPN", "MDN",
-                    "DNa02_L", "DNa02_R", "DNp01_L", "DNp01_R"]
+                    f"{steer}_L", f"{steer}_R", "DNp01_L", "DNp01_R"]
             dash = LiveDashboard(agent.retina, pops, dt=config.DT,
                                  title="flydoom — a fly plays Doom")
         else:
@@ -136,8 +173,8 @@ def main() -> int:
             print(f"  t={rec.tic / 35:5.1f}s  hp={rec.health:5.1f}  "
                   f"yaw={rec.action['TURN_LEFT_RIGHT_DELTA']:+6.2f}  "
                   f"fwd={rec.action['MOVE_FORWARD_BACKWARD_DELTA']:+6.2f}  "
-                  f"DNa02 L/R={rec.rates.get('DNa02_L', 0):6.1f}/"
-                  f"{rec.rates.get('DNa02_R', 0):6.1f}")
+                  f"{steer} L/R={rec.rates.get(f'{steer}_L', 0):6.1f}/"
+                  f"{rec.rates.get(f'{steer}_R', 0):6.1f}")
         if dash is not None and rec.tic % 2 == 0:
             lum = ag.last_luminance.detach().cpu().numpy()
             per_col = {}
@@ -149,7 +186,7 @@ def main() -> int:
                     col[eye.neuron_column] = lum[off:off + n]
                     off += n
                 per_col[side] = col
-            d = rec.rates.get("DNa02_L", 0) - rec.rates.get("DNa02_R", 0)
+            d = rec.rates.get(f"{steer}_L", 0) - rec.rates.get(f"{steer}_R", 0)
             if not dash.update(rec.tic / 35.0, per_col, rec.rates, d,
                                rec.action["TURN_LEFT_RIGHT_DELTA"] / 12.0,
                                f"tic {rec.tic}   hp {rec.health:.0f}"):
@@ -177,7 +214,7 @@ def main() -> int:
     c.check(len(hist) >= min(args.tics, 50) * 0.5, "the loop runs without crashing",
             f"{len(hist)} tics")
 
-    dn = max(max(r.rates.get("DNa02_L", 0), r.rates.get("DNa02_R", 0))
+    dn = max(max(r.rates.get(f"{steer}_L", 0), r.rates.get(f"{steer}_R", 0))
              for r in hist)
     c.check(dn > 0.5, "descending neurons are active", f"peak {dn:.1f} Hz")
 
