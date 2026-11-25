@@ -22,14 +22,18 @@ FlyWire FAFB v783 — manual download
   4. Choose snapshot  v783
      ** NOT the live materialization — it drifts, and every number in this
         repo's acceptance tests is pinned to v783. **
-  5. Download these files:
+  5. Download these files (keep the .csv.gz; they are read compressed).
+     The names must match flydoom/sources.py:
 
-       classification.csv         required  root_id, super_class, class,
-                                            sub_class, cell_type, side
-       connections.csv            required  pre_root_id, post_root_id,
-                                            neuropil, syn_count, nt_type
-       visual_neuron_types.csv    required  optic lobe typing (LC/LPLC/T4/T5)
-       cell_stats.csv             optional  sanity checks only
+       classification.csv.gz                    required  flow, super_class, class, side
+       consolidated_cell_types.csv.gz           required  primary_type (cell types live here)
+       visual_neuron_types.csv.gz               required  optic lobe typing (T4/T5/LC/LPLC)
+       labels.csv.gz                            required  community labels (BPN, aIPg)
+       connections_buhmann_no_threshold.csv.gz  required  pre, post, neuropil, syn_count, nt_type
+       column_assignment.csv.gz                 required  for eye map / dendrite experiments
+       connections_princeton_no_threshold.csv.gz optional alternative synapse pipeline
+
+     ** NOT connections_princeton.csv: its nt_type column is 100% null. **
 
   6. Put them in  data/raw/
 
@@ -45,12 +49,15 @@ INSTRUCTIONS
 echo
 echo "Currently in $RAW:"
 found=0
-for f in classification.csv connections.csv visual_neuron_types.csv cell_stats.csv; do
+for f in classification.csv.gz consolidated_cell_types.csv.gz visual_neuron_types.csv.gz labels.csv.gz \
+         connections_buhmann_no_threshold.csv.gz column_assignment.csv.gz \
+         connections_princeton_no_threshold.csv.gz; do
+  [[ -f "$RAW/$f" ]] || { [[ -f "$RAW/${f%.gz}" ]] && f="${f%.gz}"; }
   if [[ -f "$RAW/$f" ]]; then
-    printf '  [x] %-28s %s\n' "$f" "$(du -h "$RAW/$f" | cut -f1)"
+    printf '  [x] %-44s %s\n' "$f" "$(du -h "$RAW/$f" | cut -f1)"
     found=$((found + 1))
   else
-    printf '  [ ] %-28s missing\n' "$f"
+    printf '  [ ] %-44s missing\n' "$f"
   fi
 done
 echo
