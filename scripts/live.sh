@@ -10,9 +10,10 @@
 # if flydoom/wads/health_gathering_forage_easy.wad is missing.
 #
 # ViZDoom opens its window where the dashboard then opens on top of it, so on
-# X11/XWayland this run's Doom window is moved left and enlarged with xdotool
-# (apt install xdotool; position via DOOM_X/DOOM_Y/DOOM_W/DOOM_H). Without
-# xdotool, move the dashboard aside by hand.
+# X11/XWayland this run's Doom window is moved to the left with xdotool
+# (apt install xdotool; position via DOOM_X/DOOM_Y). It is not resized:
+# ViZDoom does not scale its render to the window, the rest stays black.
+# Without xdotool, move the dashboard aside by hand.
 #
 # Stop with Ctrl-C, or close the dashboard once the run ends. Extra arguments
 # after the seed go to m5_closed_loop.py unchanged (a later --tics wins).
@@ -26,7 +27,7 @@ SEED="${2:-}"
 shift $(( $# < 2 ? $# : 2 ))
 
 PY="${PYTHON:-$ROOT/.venv/bin/python}"
-X="${DOOM_X:-60}" Y="${DOOM_Y:-300}" W="${DOOM_W:-960}" H="${DOOM_H:-720}"
+X="${DOOM_X:-60}" Y="${DOOM_Y:-300}"
 KIDS="$(mktemp)"
 
 # ViZDoom engines are child processes that ignore SIGTERM, so a killed Python
@@ -47,8 +48,7 @@ place_doom_window() {
             w=$(xdotool search --pid "$kid" 2>/dev/null | head -1)
             if [[ -n "$w" ]]; then
                 sleep 0.5
-                xdotool windowmove "$w" "$X" "$Y" windowsize "$w" "$W" "$H" \
-                    windowraise "$w" 2>/dev/null
+                xdotool windowmove "$w" "$X" "$Y" windowraise "$w" 2>/dev/null
                 return
             fi
         done
