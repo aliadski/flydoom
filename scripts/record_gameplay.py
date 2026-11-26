@@ -8,8 +8,12 @@ population rates, and the steering signal -- and pipes the result to ffmpeg.
     python scripts/record_gameplay.py                    # 12 s mp4 + gif
     python scripts/record_gameplay.py --seconds 15 --no-gif
 
-Needs ffmpeg on PATH. Runs headless (no Doom window, Agg backend), so it works
-over SSH and in CI.
+    # the same picture, live in a window instead of a file (scripts/live_footage.sh)
+    python scripts/record_gameplay.py --live --seconds 300 ...
+
+Needs ffmpeg on PATH to record. Runs headless (no Doom window, Agg backend), so
+it works over SSH and in CI. --live shows the frames it would have encoded in a
+Tk window instead, so the live view and the clips are the same drawing.
 """
 
 from __future__ import annotations
@@ -78,15 +82,17 @@ def _encoder_args() -> list[str]:
 
 
 class Recorder:
-    """One matplotlib figure, redrawn per tic and pushed to ffmpeg as raw RGB."""
+    """One matplotlib figure, redrawn per tic and pushed to ffmpeg as raw RGB,
+    to a LiveWindow, or both."""
 
     def __init__(self, retina, width: int, height: int, fps: int,
-                 out: Path, history_s: float = 4.0,
+                 out: Path | None, history_s: float = 4.0,
                  screen_shape: tuple = (240, 320), cameras: tuple = (0.0,),
                  steer: str = "DNa02", splay_deg: float = 40.0,
                  fov_deg: float = 130.0, shadow: tuple | None = None,
-                 label: str | None = None):
+                 label: str | None = None, live: "LiveWindow | None" = None):
         self.label = label
+        self.live = live
         self.fps = fps
         self.steer = steer
         self.fov_deg = fov_deg
@@ -327,7 +333,7 @@ class Recorder:
         self.fig.canvas.draw()
         h, w = np.asarray(self.fig.canvas.buffer_rgba()).shape[:2]
         self.size = (w, h)
-        self.ff = subprocess.Popen(
+        self.ff = None if out is None else subprocess.Popen(
             ["ffmpeg", "-y", "-loglevel", "error",
              "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}",
              "-r", str(fps), "-i", "-",
@@ -463,7 +469,11 @@ class Recorder:
         self.banner.set_text(banner)
 
         self.fig.canvas.draw()
-        self.ff.stdin.write(self.fig.canvas.buffer_rgba())
+        buf = self.fig.canvas.buffer_rgba()
+        if self.ff is not None:
+            self.ff.stdin.write(buf)
+        # False once the window is closed: the caller stops the run.
+        return self.live.show(buf) if self.live is not None else True
 
     def new_episode(self) -> None:
         """Drop the trail. A respawn is elsewhere on the map, and carrying the
@@ -471,10 +481,68 @@ class Recorder:
         self.px.clear(); self.py.clear(); self.pang.clear()
 
     def close(self):
-        if self.ff.stdin:
-            self.ff.stdin.close()
-        self.ff.wait()
+        if self.ff is not None:
+            if self.ff.stdin:
+                self.ff.stdin.close()
+            self.ff.wait()
+        if self.live is not None:
+            self.live.close()
         plt.close(self.fig)
+
+
+class LiveWindow:
+    """Show the recorder's frames in a plain Tk window, as they are drawn.
+
+    The figure stays on the Agg backend and this window only displays its
+    pixels, so what you watch is byte for byte what --out would encode. Shrinks
+    the frame to fit a smaller screen; never enlarges it.
+    """
+
+    def __init__(self, title: str = "flydoom"):
+        import tkinter as tk
+        from PIL import Image, ImageTk
+        self._Image, self._ImageTk = Image, ImageTk
+        self.root = tk.Tk()
+        self.root.title(title)
+        self.root.configure(background=BG)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.label = tk.Label(self.root, background=BG, borderwidth=0)
+        self.label.pack()
+        self.max_w = self.root.winfo_screenwidth() - 40
+        self.max_h = self.root.winfo_screenheight() - 80
+        self.photo = None
+        self.open = True
+
+    def show(self, rgba) -> bool:
+        if not self.open:
+            return False
+        a = np.asarray(rgba)
+        img = self._Image.fromarray(a[..., :3])
+        s = min(1.0, self.max_w / img.width, self.max_h / img.height)
+        if s < 1.0:
+            img = img.resize((int(img.width * s), int(img.height * s)),
+                             self._Image.BILINEAR)
+        self.photo = self._ImageTk.PhotoImage(img)
+        self.label.configure(image=self.photo)
+        try:
+            self.root.update()
+        except Exception:          # the window was destroyed under us
+            self.open = False
+        return self.open
+
+    def hold(self) -> None:
+        """Keep the last frame up until the window is closed."""
+        if self.open:
+            self.root.title(self.root.title() + " — done, close to exit")
+            self.root.mainloop()
+
+    def close(self) -> None:
+        if self.open:
+            self.open = False
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
 
 
 def per_column_luminance(agent, adapted: bool = False):
@@ -542,7 +610,17 @@ def main() -> int:
                          "monsters, so movement is visible. "
                          "defend_the_center pins the player in a bare "
                          "circular room and shows nothing.")
-    ap.add_argument("--out", type=Path, default=Path("media/flydoom.mp4"))
+    ap.add_argument("--out", type=Path, default=None,
+                    help="the clip to write (default media/flydoom.mp4; "
+                         "with --live, no file unless given)")
+    ap.add_argument("--live", action="store_true",
+                    help="show the frames in a window as they are drawn, "
+                         "instead of only encoding them. Closing the window "
+                         "stops the run.")
+    ap.add_argument("--every", type=int, default=1, metavar="N",
+                    help="with --live, draw one tic in N (the simulation still "
+                         "runs every tic); 2 or 3 roughly doubles or triples "
+                         "the pace on a slow GPU")
     ap.add_argument("--width", type=int, default=1760)
     ap.add_argument("--height", type=int, default=640)
     ap.add_argument("--no-smell", action="store_true",
@@ -632,11 +710,27 @@ def main() -> int:
                                  else "cpu")))
     args = ap.parse_args()
 
-    if shutil.which("ffmpeg") is None:
+    if args.out is None and not args.live:
+        args.out = Path("media/flydoom.mp4")
+    if args.out is None:
+        args.no_gif = True
+    elif shutil.which("ffmpeg") is None:
         print("ffmpeg not found on PATH", file=sys.stderr)
         return 1
-
-    args.out.parent.mkdir(parents=True, exist_ok=True)
+    if args.every < 1 or (args.every > 1 and args.out is not None):
+        print("--every needs --live and no --out: a clip skips no tics",
+              file=sys.stderr)
+        return 1
+    live = None
+    if args.live:
+        from flydoom.viz import have_display
+        if not have_display():
+            print("--live needs a display", file=sys.stderr)
+            return 1
+        live = LiveWindow("flydoom — a frozen FlyWire connectome plays Doom"
+                          + (f" · {args.label}" if args.label else ""))
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
     tics = int(args.seconds * TICS_PER_SECOND)
 
     # Smell ON. It is off by default because M6/M7 are only valid without it,
@@ -688,7 +782,8 @@ def main() -> int:
         agent.doom.step = tethered
     print(agent.summary())
     print(f"\nrecording {tics} tics ({args.seconds:.0f} s) "
-          f"after {args.warmup} warmup tics -> {args.out}")
+          f"after {args.warmup} warmup tics -> "
+          f"{args.out if args.out is not None else 'a live window'}")
 
     # The lockstep copy: same map geometry, same seed, stock textures, and a
     # field of view a person can read rather than the fly's 170 degrees.
@@ -707,10 +802,10 @@ def main() -> int:
                    cameras=agent.vision.cameras, steer=args.yaw_source,
                    splay_deg=dc.splay_deg, fov_deg=dc.fov_deg,
                    shadow=(480, 640) if shadow else None,
-                   label=args.label)
+                   label=args.label, live=live)
     print(f"canvas {rec.size[0]}x{rec.size[1]}")
 
-    state = {"n": 0, "episode": 0}
+    state = {"n": 0, "episode": 0, "stop": False}
 
     def on_tic(ag, r):
         if r.tic < args.warmup:
@@ -731,12 +826,17 @@ def main() -> int:
         smelling = ("" if sm is None else
                     f"   smell f{sm[0]:.2f} r{sm[1]:.2f}")
         shadow_frame = None
+        drawn = state["n"] % args.every == 0
         if shadow is not None and not shadow.finished:
             # the agent has already taken this tic, so the copy takes the same
             # one and the two land on the same game state
             shadow.step([r.action[b] for b in DoomSession.BUTTONS])
-            shadow_frame = shadow.frame()
-        rec.draw(ag.doom.frame(),
+            if drawn:
+                shadow_frame = shadow.frame()
+        if not drawn:
+            state["n"] += 1
+            return state["n"] < tics
+        if not rec.draw(ag.doom.frame(),
                  per_column_luminance(ag, args.eye_panel == "adapted"),
                  r.rates, d,
                  r.action["TURN_LEFT_RIGHT_DELTA"] / 12.0, t,
@@ -747,7 +847,9 @@ def main() -> int:
                  + ("" if state["episode"] == 0
                     else f"   life {state['episode'] + 1}"),
                  pos=pos, angle=ang, objects=objs, smell=sm,
-                 shadow=shadow_frame)
+                 shadow=shadow_frame):
+            state["stop"] = True          # the live window was closed
+            return False
         state["n"] += 1
         if state["n"] % 35 == 0:
             print(f"  {state['n'] / TICS_PER_SECOND:4.1f} s recorded")
@@ -757,7 +859,7 @@ def main() -> int:
         # The agent dies, and agent.run() stops when the episode does. Keep
         # starting fresh episodes until the requested length is recorded,
         # rather than silently returning a clip shorter than asked for.
-        while state["n"] < tics:
+        while state["n"] < tics and not state["stop"]:
             before = state["n"]
             if shadow is not None:
                 shadow.new_episode()     # the agent's run() resets its own
@@ -765,17 +867,23 @@ def main() -> int:
             if state["n"] == before:      # made no progress; stop rather than spin
                 print("  episode produced no frames; stopping")
                 break
-            if state["n"] < tics:
+            if state["n"] < tics and not state["stop"]:
                 state["episode"] += 1
                 rec.new_episode()
                 print(f"  died at {state['n'] / TICS_PER_SECOND:.1f} s "
                       f"— starting episode {state['episode'] + 1}")
+        state["finished"] = True
     finally:
         agent.close()
         if shadow is not None:
             shadow.close()
+        # only after a run that ended by itself, not on Ctrl-C or an error
+        if live is not None and state.get("finished") and not state["stop"]:
+            live.hold()
         rec.close()
 
+    if args.out is None:
+        return 0
     print(f"wrote {args.out}  ({args.out.stat().st_size / 1e6:.1f} MB)")
 
     if not args.no_gif:
